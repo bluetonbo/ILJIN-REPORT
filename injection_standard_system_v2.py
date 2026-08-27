@@ -16,14 +16,28 @@
 배포: Streamlit Community Cloud (기존 IMS/AUTO-DESIGN 앱과 동일 패턴)
 secrets.toml:
     GEMINI_API_KEY = "..."
+    OWNER_PASSWORD = "nt1234"
+    SHEET_ID = "..."          # 임시 비밀번호 저장용 Google Sheet ID
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "..."
+    private_key_id = "..."
+    private_key = "..."
+    client_email = "..."
+    client_id = "..."
+    token_uri = "https://oauth2.googleapis.com/token"
 """
 
 import json
 import io
-from datetime import date
+import random
+import string
+from datetime import date, datetime, timedelta
 
 import streamlit as st
 import google.generativeai as genai
+import gspread
+from google.oauth2.service_account import Credentials
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -37,6 +51,164 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 st.set_page_config(page_title="사출 표준서 자동생성 시스템", layout="wide")
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
+TEMP_PWD_SHEET_NAME = "temp_passwords"
+TEMP_PWD_HEADER = ["비밀번호", "발급일", "만료일", "비고"]
+
+
+# ============================================================
+# 로그인 모듈 (BA-HT / BA-ROLLER / JOINT-AI-APP-6 과 동일한 패턴)
+#   - 오너 비밀번호: st.secrets["OWNER_PASSWORD"] (기본 nt1234)
+#   - 임시 비밀번호: Google Sheets에 영구 저장, 만료일 관리
+# ============================================================
+def _sanitize_secret_text(value: str) -> str:
+    """secrets.toml에 저장된 private_key 등에서 literal '\\n'을 실제 개행으로 교정."""
+    if not value:
+        return value
+    return value.replace("\\n", "\n").strip()
+
+
+def get_gsheet_client():
+    sa_info = dict(st.secrets.get("gcp_service_account", {}))
+    if not sa_info:
+        st.error("st.secrets['gcp_service_account'] 가 설정되어 있지 않습니다.")
+        st.stop()
+    if "private_key" in sa_info:
+        sa_info["private_key"] = _sanitize_secret_text(sa_info["private_key"])
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def get_temp_pwd_worksheet():
+    sheet_id = st.secrets.get("SHEET_ID", "")
+    if not sheet_id:
+        st.error("st.secrets['SHEET_ID'] 가 설정되어 있지 않습니다.")
+        st.stop()
+    client = get_gsheet_client()
+    sh = client.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(TEMP_PWD_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TEMP_PWD_SHEET_NAME, rows=100, cols=len(TEMP_PWD_HEADER))
+        ws.update([TEMP_PWD_HEADER])
+    return ws
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_temp_passwords() -> list:
+    """Google Sheets에서 임시 비밀번호 목록을 읽어온다 (30초 캐시)."""
+    try:
+        ws = get_temp_pwd_worksheet()
+        records = ws.get_all_records()
+        return records
+    except Exception as e:
+        st.warning(f"임시 비밀번호 목록을 불러오지 못했습니다: {e}")
+        return []
+
+
+def add_temp_password(password: str, valid_days: int, note: str = ""):
+    """새 임시 비밀번호 발급. append_row만 사용해 기존 데이터 유실 위험이 없다."""
+    ws = get_temp_pwd_worksheet()
+    today = date.today()
+    expiry = today + timedelta(days=valid_days)
+    ws.append_row([password, str(today), str(expiry), note])
+    load_temp_passwords.clear()
+
+
+def _save_temp_pwds(records: list):
+    """전체 목록을 재작성할 때만 사용. 반드시 clear() 이후 update() 순서를 지켜야
+    한다 (BA-HT에서 이 순서가 뒤바뀌어 시트가 비는 버그가 있었던 부분과 동일 주의사항)."""
+    ws = get_temp_pwd_worksheet()
+    rows = [TEMP_PWD_HEADER] + [[r.get(h, "") for h in TEMP_PWD_HEADER] for r in records]
+    ws.clear()
+    ws.update(rows)
+    load_temp_passwords.clear()
+
+
+def delete_temp_password(password_to_delete: str):
+    records = load_temp_passwords()
+    remaining = [r for r in records if r.get("비밀번호") != password_to_delete]
+    _save_temp_pwds(remaining)
+
+
+def validate_temp_password(password: str) -> bool:
+    if not password:
+        return False
+    today = date.today()
+    for r in load_temp_passwords():
+        if str(r.get("비밀번호", "")) == password:
+            try:
+                expiry = datetime.strptime(str(r.get("만료일", "")), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if today <= expiry:
+                return True
+    return False
+
+
+def generate_temp_password(length: int = 8) -> str:
+    chars = string.ascii_uppercase + string.digits
+    return "".join(random.choice(chars) for _ in range(length))
+
+
+def render_login_screen():
+    st.title("사출 표준서 자동생성 시스템")
+    st.caption("로그인이 필요합니다.")
+    with st.form("login_form"):
+        pwd = st.text_input("비밀번호", type="password")
+        submitted = st.form_submit_button("로그인", use_container_width=True)
+    if submitted:
+        owner_pwd = st.secrets.get("OWNER_PASSWORD", "nt1234")
+        if pwd == owner_pwd:
+            st.session_state.auth_role = "owner"
+            st.session_state.authenticated = True
+            st.rerun()
+        elif validate_temp_password(pwd):
+            st.session_state.auth_role = "user"
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 올바르지 않거나 만료되었습니다. 담당자에게 임시 비밀번호를 요청하세요.")
+    st.stop()
+
+
+def render_owner_admin_panel():
+    """오너 로그인 시에만 사이드바에 노출되는 임시 비밀번호 관리 패널."""
+    with st.sidebar.expander("임시 비밀번호 관리 (오너 전용)", expanded=False):
+        c1, c2 = st.columns(2)
+        valid_days = c1.number_input("유효기간(일)", min_value=1, max_value=365, value=30)
+        note = c2.text_input("비고", value="")
+        if st.button("새 임시 비밀번호 발급", use_container_width=True):
+            new_pwd = generate_temp_password()
+            add_temp_password(new_pwd, valid_days, note)
+            st.success(f"발급됨: {new_pwd} (만료: {date.today() + timedelta(days=valid_days)})")
+
+        st.divider()
+        records = load_temp_passwords()
+        if not records:
+            st.caption("발급된 임시 비밀번호가 없습니다.")
+        for r in records:
+            c1, c2 = st.columns([0.8, 0.2])
+            c1.markdown(f"`{r.get('비밀번호','')}` · 만료 {r.get('만료일','')} · {r.get('비고','')}")
+            if c2.button("삭제", key=f"del_pwd_{r.get('비밀번호','')}"):
+                delete_temp_password(r.get("비밀번호"))
+                st.rerun()
+
+
+def require_login():
+    st.session_state.setdefault("authenticated", False)
+    st.session_state.setdefault("auth_role", None)
+    if not st.session_state.authenticated:
+        render_login_screen()
+    if st.session_state.auth_role == "owner":
+        render_owner_admin_panel()
+    with st.sidebar:
+        st.caption(f"로그인 상태: {'오너' if st.session_state.auth_role == 'owner' else '사용자'}")
+        if st.button("로그아웃"):
+            st.session_state.authenticated = False
+            st.session_state.auth_role = None
+            st.rerun()
 
 
 def get_model():
@@ -523,6 +695,11 @@ def build_xlsx(context: dict, items: list) -> bytes:
     buf.seek(0)
     return buf.read()
 
+
+# ============================================================
+# 로그인 게이트 (이 아래부터가 실제 앱 UI)
+# ============================================================
+require_login()
 
 # ============================================================
 # UI - 상단 진행 표시
