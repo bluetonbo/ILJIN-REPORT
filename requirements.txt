@@ -1,0 +1,7 @@
+streamlit
+google-generativeai
+gspread
+google-auth
+python-docx
+python-pptx
+openpyxl
